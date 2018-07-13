@@ -8,16 +8,50 @@ if sys.version_info[0] < 3:
 else:
     import builtins 
 
+from prometheus_client import Counter, Summary
+
 import reststore
 from reststore import config
 
+reststore_cache_counter = Counter(
+    'reststore_cache_lookups_total',
+    'RestStore client cache lookup counter',
+    ['result']
+)
+
+reststore_cache_expiry_summary = Summary(
+    'reststore_cache_expiry_duration_seconds',
+    'Time spent expiring local cache',
+)
+
+def expire_cache(f):
+    """
+    Decorator to expire any candidate files
+    from the local instance if caching enabled.
+    """
+    def wrap(self, *args, **kwargs):
+        if self.cache_max_entries > 0 and \
+            self.cache_batch_delete > 0 and \
+            len(self._files) > self.cache_max_entries:
+            with reststore_cache_expiry_summary.time():
+                self._files.expire(self.cache_batch_delete)
+
+        return f(self, *args, **kwargs)
+    return wrap
+
 class FilesClient(object):
-    def __init__(self, name=None, uri=None, requester=requests):
+    def __init__(self, name=None, uri=None,
+        cache_max_entries=None, cache_batch_delete=None,
+        requester=requests):
         """
 
         """
         name = name or config.values['files']['name']
         uri = uri or config.values['client']['uri']
+        self.cache_max_entries = cache_max_entries or \
+            config.values['client']['cache_max_entries']
+        self.cache_batch_delete = cache_batch_delete or \
+            config.values['client']['cache_batch_delete']
         self.requester = requester
         self._files = reststore.Files(name=name)
         self._name = name
@@ -58,12 +92,16 @@ class FilesClient(object):
         except KeyError:
             return d
 
+    @expire_cache
     def __getitem__(self, hexdigest):
         # try and get the file back locally first
         try:
-            return self._files[hexdigest]
+            f = self._files[hexdigest]
+            reststore_cache_counter.labels('hit').inc()
+            return f
         except KeyError:
-            pass
+            reststore_cache_counter.labels('miss').inc()
+
         # fetch data from server
         uri = "%s%s/file/%s" % (self._uri, self._name, hexdigest)
         data = self.request('get', uri)['result']
@@ -77,7 +115,8 @@ class FilesClient(object):
 
     def __setitem__(self, hexdigest, data):
         self.put(data, hexdigest=hexdigest)
-        
+
+    @expire_cache
     def put(self, data, hexdigest=None):
         hexdigest = self._files.put(data, hexdigest=hexdigest)
         if hexdigest in self:
@@ -87,6 +126,7 @@ class FilesClient(object):
         self.request('put', uri, data=data)
         return hexdigest
 
+    @expire_cache
     def bulk_put(self, data, hexdigest=None):
         hexdigest = self._files.put(data, hexdigest=hexdigest)
         if hexdigest in self:
@@ -120,4 +160,3 @@ class FilesClient(object):
             i += step
             hexdigests = self.select(i, i + step)
 
-            
